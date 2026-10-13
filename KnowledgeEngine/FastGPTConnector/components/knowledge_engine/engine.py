@@ -225,9 +225,17 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             # The mapping is recorded before the fence is released: a
             # cancellation or a Host failure here must not leave an uploaded
             # collection with no durable record of it.
-            await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
-                'dataset_id': dataset_id, 'status': 'created',
-                'api_base_url': upstream_target})
+            try:
+                await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
+                    'dataset_id': dataset_id, 'status': 'created',
+                    'api_base_url': upstream_target})
+            except Exception as exc:
+                # The collection already exists. A Host persistence error must
+                # preserve the fence and surface as interrupted, not return the
+                # unrelated Host UUID as a failed upstream document identity.
+                raise AmbiguousMutationError(
+                    'FastGPT collection created but mapping commit failed; reconcile before retry'
+                ) from exc
             return collection_id, insert_len, None
 
         try:
