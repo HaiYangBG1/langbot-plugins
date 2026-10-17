@@ -99,3 +99,37 @@ def test_disabled_box_never_prepares():
     ctx.config["box-enabled"] = False
     box = LocalAgentBox(ctx, SimpleContext(get_allowed_tools=lambda: [SimpleContext(tool_name="exec")]))
     assert not box.needed()
+
+
+@pytest.mark.asyncio
+async def test_plain_response_and_non_sandbox_tools_do_not_acquire():
+    ctx = context()
+    api = SimpleContext(
+        get_allowed_tools=lambda: [SimpleContext(tool_name="exec")],
+        get_box_status=AsyncMock(), acquire_box=AsyncMock(),
+        call_tool=AsyncMock(return_value={"answer": "ok"}),
+    )
+    box = LocalAgentBox(ctx, api)
+    assert box.needed()
+    assert await box.finish() == []
+    assert await box.call_tool("search", {}) == {"answer": "ok"}
+    api.acquire_box.assert_not_awaited()
+    api.get_box_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parallel_sandbox_tools_acquire_once_and_publish_outbox():
+    import asyncio
+    ctx = context()
+    original = {"stdout": "ok"}
+    api = SimpleContext(
+        get_box_status=AsyncMock(return_value=BoxStatus(enabled=True, available=True)),
+        acquire_box=AsyncMock(return_value=BoxSession(id="box", status="ready")),
+        call_tool=AsyncMock(return_value=original),
+    )
+    box = LocalAgentBox(ctx, api)
+    results = await asyncio.gather(box.call_tool("exec", {}), box.call_tool("read", {}))
+    api.acquire_box.assert_awaited_once_with("group_room")
+    ctx.bind_box.assert_awaited_once_with("box")
+    assert all(r["sandbox_outbox"] == "/out/run-1" for r in results)
+    assert original == {"stdout": "ok"}
