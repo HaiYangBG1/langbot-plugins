@@ -47,6 +47,7 @@ class AgentLoop:
         max_tool_iterations: int,
         tool_execution_mode: ToolExecutionMode | str = ToolExecutionMode.PARALLEL,
         hooks: AgentLoopHooks | None = None,
+        before_complete: typing.Callable[[], typing.Awaitable[str | None]] | None = None,
     ):
         self.model_adapter = model_adapter
         self.tool_executor = tool_executor
@@ -57,6 +58,7 @@ class AgentLoop:
         self.max_tool_iterations = max_tool_iterations
         self.tool_execution_mode = self._normalize_tool_execution_mode(tool_execution_mode)
         self.hooks = hooks or AgentLoopHooks()
+        self.before_complete = before_complete
         self._last_tool_batch_terminates = False
         self._usage: dict[str, typing.Any] | None = None
 
@@ -321,6 +323,12 @@ class AgentLoop:
                 if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
+                if self.before_complete is not None:
+                    feedback = await self.before_complete()
+                    if feedback:
+                        self.messages.append(Message(role="system", content=feedback))
+                        pending_tool_calls = None
+                        continue
                 yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                 return
 
@@ -422,6 +430,12 @@ class AgentLoop:
                 if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
+                if self.before_complete is not None:
+                    feedback = await self.before_complete()
+                    if feedback:
+                        self.messages.append(Message(role="system", content=feedback))
+                        pending_tool_calls = None
+                        continue
                 yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                 return
 

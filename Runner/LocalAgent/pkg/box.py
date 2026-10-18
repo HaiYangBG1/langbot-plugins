@@ -41,6 +41,43 @@ class LocalAgentBox:
         self.ctx = ctx
         self.api = api
         self.binding = None
+        self.file_ids = []
+        self._repair_attempts = 0
+
+    async def before_complete(self):
+        if self.binding is None:
+            return None
+        try:
+            files = await self.ctx.export_box_files()
+        except Exception as exc:
+            reason = str(exc)
+            # SDK 0.7.13 transports Host exceptions as text. Only known
+            # read/budget failures are safe to repair; never retry delivery,
+            # cancellation, permissions, stale bindings or unknown IO errors.
+            repairable = any(
+                marker in reason
+                for marker in (
+                    "Sandbox outbox exceeds ",
+                    "Sandbox output attachment exceeds the export size limit",
+                    "At most 100 output files may be exported per run",
+                    "Output files exceed the per-run byte limit",
+                )
+            )
+            if not repairable or self._repair_attempts >= 2:
+                raise
+            self._repair_attempts += 1
+            return (
+                f"Attachment export failed (repair {self._repair_attempts}/2): {reason}. "
+                "Files have not been delivered. Repair the outbox using the existing tools, "
+                "then finish again. Do not repeat unrelated actions or silently discard requested files. "
+                "The same run deadline and tool budget still apply."
+            )
+        self.file_ids = [item.id for item in files]
+        # Platform delivery errors are not file-generation errors.
+        if self.file_ids and not self.ctx.delivery.automatic_reply:
+            await self.ctx.reply_files(self.file_ids)
+            self.file_ids = []
+        return None
 
     def needed(self):
         tools = {t.tool_name for t in self.api.get_allowed_tools()}
