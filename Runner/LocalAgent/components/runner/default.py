@@ -217,7 +217,7 @@ class DefaultRunner(Runner):
 
         box = LocalAgentBox(ctx, api)
         try:
-            if box.needed():
+            if box.needed() and ctx.input.attachments:
                 await interrupt_checker.wait_for(box.prepare(), deadline=deadline)
             assembly = await interrupt_checker.wait_for(
                 AgentRunAssembler(api, ctx).assemble(),
@@ -254,6 +254,9 @@ class DefaultRunner(Runner):
                 retryable=False,
             )
             return
+
+        if box.needed():
+            assembly.tool_executor.api = box
 
         try:
             results = self._run_runner_loop(

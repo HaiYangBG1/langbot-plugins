@@ -1,5 +1,6 @@
 """LocalAgent's sandbox policy and explicit file preparation/delivery."""
 
+import asyncio
 from string import Formatter
 
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
@@ -41,6 +42,8 @@ class LocalAgentBox:
         self.ctx = ctx
         self.api = api
         self.binding = None
+        self._prepare_lock = asyncio.Lock()
+        self._prepared = False
 
     def needed(self):
         tools = {t.tool_name for t in self.api.get_allowed_tools()}
@@ -51,6 +54,24 @@ class LocalAgentBox:
         )
 
     async def prepare(self):
+        # Parallel tool calls share one binding and attachment import per run.
+        async with self._prepare_lock:
+            if self._prepared:
+                return
+            await self._prepare()
+            self._prepared = True
+
+    async def call_tool(self, tool_name, parameters):
+        if tool_name in SANDBOX_TOOLS:
+            await self.prepare()
+        result = await self.api.call_tool(tool_name=tool_name, parameters=parameters)
+        if tool_name in SANDBOX_TOOLS and isinstance(result, dict):
+            # Lazy preparation happens after prompt assembly. Tell the model
+            # where deliverable files belong through the tool result instead.
+            result = {**result, "sandbox_outbox": self.binding.outbox}
+        return result
+
+    async def _prepare(self):
         status = await self.api.get_box_status()
         if not status.available:
             raise RuntimeError(status.reason or "Box is unavailable")

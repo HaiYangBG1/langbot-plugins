@@ -343,6 +343,7 @@ async def test_scope_grants_not_foreign_config(sdk_runtime, resource):
 @pytest.mark.parametrize("denied_a", [False, True])
 @pytest.mark.parametrize("automatic_reply", [False, True])
 async def test_scoped_box_binding_and_exports(sdk_runtime, denied_a, automatic_reply):
+    from langbot_plugin.api.entities.builtin.runner.input import InputAttachment
     from langbot_plugin.api.entities.builtin.runner.resources import ToolResource
 
     host = sdk_runtime
@@ -386,8 +387,14 @@ async def test_scoped_box_binding_and_exports(sdk_runtime, denied_a, automatic_r
         assert data["file_ids"] == [f"file-{owner}"]
         return ActionResponse.success({"result": {"ok": True}})
 
+    @host.host.action(P.IMPORT_BOX_ATTACHMENTS)
+    async def import_files(data):
+        host.record("box_import", data)
+        return ActionResponse.success({"items": []})
+
     contexts = [context(o) for o in ("a", "b")]
     for ctx in contexts:
+        ctx.input.attachments = [InputAttachment(ref="input", name="input.txt")]
         ctx.delivery.automatic_reply = automatic_reply
         ctx.context.available_apis.box = True
         ctx.config["box-session-id-template"] = "{global}"
