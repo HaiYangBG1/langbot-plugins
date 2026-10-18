@@ -448,6 +448,7 @@ class ContextAssembler:
         history_messages, history_cursors = await self._get_history_messages(checkpoint)
 
         prompt_messages = build_prompt_messages(await self._get_prompt_config())
+        system_instructions = []
         if self.ctx.config.get("date-grounding", True) is not False:
             # Runtime clock, not the event timestamp: replayed events may be old.
             # UTC is explicit so a separate plugin process cannot imply Host/user time.
@@ -459,20 +460,24 @@ class ContextAssembler:
                 "financial results, news, current events, exchange rates, or similar — "
                 "verify with a search tool if one is available rather than answering from memory."
             )
+            system_instructions.append(date_guidance)
+        skills_message = build_skills_system_message(self.ctx)
+        if skills_message is not None:
+            system_instructions.append(skills_message.content)
+        platform_tools_message = build_platform_tools_system_message(self.ctx)
+        if platform_tools_message is not None:
+            system_instructions.append(platform_tools_message.content)
+        if system_instructions:
+            # Strict chat templates only accept a system message at position zero.
+            guidance = "\n\n".join(system_instructions)
             if prompt_messages and prompt_messages[0].role == "system":
                 head = prompt_messages[0]
                 if isinstance(head.content, str):
-                    head.content += "\n\n" + date_guidance
+                    head.content += "\n\n" + guidance
                 else:
-                    head.content.append(ContentElement.from_text(date_guidance))
+                    head.content.append(ContentElement.from_text(guidance))
             else:
-                prompt_messages.insert(0, Message(role="system", content=date_guidance))
-        skills_message = build_skills_system_message(self.ctx)
-        if skills_message is not None:
-            prompt_messages = [*prompt_messages, skills_message]
-        platform_tools_message = build_platform_tools_system_message(self.ctx)
-        if platform_tools_message is not None:
-            prompt_messages = [*prompt_messages, platform_tools_message]
+                prompt_messages.insert(0, Message(role="system", content=guidance))
         checkpoint_messages = self._checkpoint_messages(checkpoint)
         checkpoint_cursors = [checkpoint.covers_until for _ in checkpoint_messages] if checkpoint else []
         rag_messages = [rag_message] if rag_message is not None else []
