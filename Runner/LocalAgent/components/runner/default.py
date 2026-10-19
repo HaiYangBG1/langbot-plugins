@@ -223,6 +223,8 @@ class DefaultRunner(Runner):
                 AgentRunAssembler(api, ctx).assemble(),
                 deadline=deadline,
             )
+            if box.binding is not None:
+                box.install_tool(assembly)
         except NoAuthorizedModelError:
             yield RunnerResult.run_failed(
                 ctx.run_id,
@@ -263,7 +265,6 @@ class DefaultRunner(Runner):
                 interrupt_checker=interrupt_checker,
                 usage_tracker=usage_tracker,
                 reasoning_levels=model_reasoning_levels(config),
-                before_complete=box.before_complete,
             )
             async with aclosing(_iterate_with_run_controls(results, interrupt_checker, deadline)) as owned_stream:
                 async for result in owned_stream:
@@ -294,7 +295,6 @@ class DefaultRunner(Runner):
         interrupt_checker: RunInterruptChecker | None = None,
         usage_tracker: RunUsageTracker | None = None,
         reasoning_levels: dict[str, str] | None = None,
-        before_complete=None,
     ) -> AsyncGenerator[RunnerResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
         loop = AgentLoop(
@@ -309,7 +309,6 @@ class DefaultRunner(Runner):
             max_tool_iterations=assembly.max_tool_iterations,
             tool_execution_mode=assembly.tool_execution_mode,
             hooks=assembly.hooks,
-            before_complete=before_complete,
         )
 
         final_message: Message | None = None

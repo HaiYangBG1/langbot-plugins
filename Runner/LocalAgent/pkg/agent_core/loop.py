@@ -47,7 +47,6 @@ class AgentLoop:
         max_tool_iterations: int,
         tool_execution_mode: ToolExecutionMode | str = ToolExecutionMode.PARALLEL,
         hooks: AgentLoopHooks | None = None,
-        before_complete: typing.Callable[[], typing.Awaitable[str | None]] | None = None,
     ):
         self.model_adapter = model_adapter
         self.tool_executor = tool_executor
@@ -58,7 +57,6 @@ class AgentLoop:
         self.max_tool_iterations = max_tool_iterations
         self.tool_execution_mode = self._normalize_tool_execution_mode(tool_execution_mode)
         self.hooks = hooks or AgentLoopHooks()
-        self.before_complete = before_complete
         self._last_tool_batch_terminates = False
         self._usage: dict[str, typing.Any] | None = None
 
@@ -112,17 +110,6 @@ class AgentLoop:
 
     def _current_usage(self) -> dict[str, typing.Any] | None:
         return dict(self._usage) if self._usage else None
-
-    async def _finalize(self, *, allow_repair: bool) -> bool:
-        if self.before_complete is None:
-            return True
-        feedback = await self.before_complete()
-        if not feedback:
-            return True
-        if not allow_repair:
-            raise RuntimeError("Attachment delivery failed within the remaining run budget. " + feedback)
-        self.messages.append(Message(role="user", content=feedback))
-        return False
 
     async def _execute_prepared_tool_calls_parallel(
         self,
@@ -218,7 +205,6 @@ class AgentLoop:
             )
         yield AgentLoopEvent.message_end(final_message)
         yield AgentLoopEvent.turn_end(final_message, [], usage=self._current_usage())
-        await self._finalize(allow_repair=False)
         yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
 
     async def _run_streaming(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
@@ -251,7 +237,6 @@ class AgentLoop:
                     yield self._tool_batch_failed_event(e)
                     return
                 if self._last_tool_batch_terminates:
-                    await self._finalize(allow_repair=False)
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
 
@@ -321,7 +306,6 @@ class AgentLoop:
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                     yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
-                    await self._finalize(allow_repair=False)
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
                 messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
@@ -335,10 +319,6 @@ class AgentLoop:
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
                 if has_follow_up_messages:
-                    pending_tool_calls = None
-                    continue
-                if not await self._finalize(allow_repair=True):
-                    visible_content_prefix += model_turn.visible_content
                     pending_tool_calls = None
                     continue
                 yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
@@ -375,7 +355,6 @@ class AgentLoop:
                     yield self._tool_batch_failed_event(e)
                     return
                 if self._last_tool_batch_terminates:
-                    await self._finalize(allow_repair=False)
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
 
@@ -428,7 +407,6 @@ class AgentLoop:
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                     yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
-                    await self._finalize(allow_repair=False)
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
                 messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
@@ -442,9 +420,6 @@ class AgentLoop:
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
                 if has_follow_up_messages:
-                    pending_tool_calls = None
-                    continue
-                if not await self._finalize(allow_repair=True):
                     pending_tool_calls = None
                     continue
                 yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())

@@ -1,188 +1,113 @@
-import asyncio
+"""Export errors are ordinary tool results; no completion recovery hook."""
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from langbot_plugin.api.entities.builtin.runner.box import BoxFile
 
+from pkg.agent_core.langbot import LangBotToolExecutor
+from pkg.agent_core.types import ToolCallRequest
 from pkg.box import LocalAgentBox
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("automatic", [True, False])
-async def test_export_repair_then_success(automatic):
+async def test_explicit_export_error_then_retry():
     ctx = SimpleNamespace(
         export_box_files=AsyncMock(
-            side_effect=[
-                RuntimeError("Sandbox outbox exceeds the file-count limit"),
-                [SimpleNamespace(id="file")],
-            ]
+            side_effect=[RuntimeError("file missing: /out/a"), [BoxFile(id="file", name="a", type="File", size=1)]]
         ),
+        delivery=SimpleNamespace(automatic_reply=True),
         reply_files=AsyncMock(),
-        delivery=SimpleNamespace(automatic_reply=automatic),
     )
     box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    assert "repair 1/2" in await box.before_complete()
-    assert await box.before_complete() is None
-    assert box.file_ids == (["file"] if automatic else [])
-    assert ctx.export_box_files.await_count == 2
-    assert ctx.reply_files.await_count == (0 if automatic else 1)
-
-
-@pytest.mark.asyncio
-async def test_repair_is_bounded():
-    ctx = SimpleNamespace(
-        export_box_files=AsyncMock(side_effect=RuntimeError("Output files exceed the per-run byte limit"))
+    executor = LangBotToolExecutor(None, set())
+    assembly = SimpleNamespace(tools=[], tool_executor=executor)
+    box.install_tool(assembly)
+    request = ToolCallRequest.from_raw(
+        {
+            "id": "export",
+            "type": "function",
+            "function": {"name": "export_box_files", "arguments": '{"paths": ["/out/a"]}'},
+        }
     )
-    box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    assert "repair 1/2" in await box.before_complete()
-    assert "repair 2/2" in await box.before_complete()
-    with pytest.raises(RuntimeError):
-        await box.before_complete()
-    assert ctx.export_box_files.await_count == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error",
-    [PermissionError("denied"), TimeoutError(), asyncio.CancelledError(), RuntimeError("stale Workspace placement")],
-)
-async def test_unrepairable_error_propagates(error):
-    ctx = SimpleNamespace(export_box_files=AsyncMock(side_effect=error))
-    box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    with pytest.raises(type(error)):
-        await box.before_complete()
-    assert box._repair_attempts == 0
-
-
-def detailed_error(code="box.export.limit_exceeded", **details):
-    from langbot_plugin.api.entities.builtin.runner.errors import AgentAPIError
-
-    return AgentAPIError(
-        code=code,
-        message="Attachment export failed: Sandbox outbox exceeds the file-count limit",
-        retryable=True,
-        details={
-            "version": 1,
-            "phase": "export",
-            "limit_type": "file_count",
-            "limit": 20,
-            "actual": 21,
-            "actual_is_lower_bound": True,
-            "remaining": None,
-            "relative_paths": ["nested/answer.txt"],
-            "files_retained": True,
-            "suggested_action": "Consolidate the requested files.",
-            **details,
-        },
-    )
-
-
-@pytest.mark.parametrize("relay", [False, True])
-def test_structured_and_sdk_text_relay_preserve_actionable_feedback(relay):
-    from langbot_plugin.api.entities.builtin.runner.errors import AgentAPIException
-
-    from pkg.box import export_failure, repair_feedback
-
-    error = detailed_error()
-    transported = (
-        RuntimeError("ActionCallError: ActionCallError: LANGBOT_EXPORT_V1:" + error.model_dump_json())
-        if relay
-        else AgentAPIException(error)
-    )
-    feedback = repair_feedback(export_failure(transported))
-    for fact in ('"limit": 20', '"actual": 21', "nested/answer.txt", '"files_retained": true', "Consolidate"):
-        assert fact in feedback
-
-
-@pytest.mark.parametrize(
-    "details",
-    [
-        {"limit_type": []},
-        {"limit": True},
-        {"actual": 20},
-        {"remaining": -1},
-        {"relative_paths": ["../secret"]},
-        {"files_retained": False},
-        {"version": 2},
-    ],
-)
-def test_incomplete_or_invalid_quota_details_are_not_repairable(details):
-    from pkg.box import repair_feedback
-
-    assert repair_feedback(detailed_error(**details)) is None
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Invalid JSON",
-        "failed with a file-count limit in user input",
-        "prefix LANGBOT_EXPORT_V1:{}",
-        "LANGBOT_EXPORT_V1:{broken",
-    ],
-)
-def test_unknown_failure_text_is_never_guessed_as_quota_or_truncation(message):
-    from pkg.box import export_failure
-
-    assert export_failure(RuntimeError(message)) is None
-
-
-def test_explicit_transport_truncation_allows_unknown_actual_size():
-    from pkg.box import repair_feedback
-
-    assert (
-        repair_feedback(
-            detailed_error(
-                code="box.export.transport_truncated",
-                limit_type="transport_bytes",
-                limit=1048576,
-                actual=None,
-            )
-        )
-        is not None
-    )
-    assert repair_feedback(detailed_error(code="box.export.invalid_response")) is None
+    failed = await executor.execute(executor.prepare(request))
+    assert "file missing" in failed.error
+    assert not box.file_ids
+    success = await executor.execute(executor.prepare(request))
+    assert success.error is None
+    assert box.file_ids == ["file"]
+    assert not hasattr(box, "before_complete")
+    assert not hasattr(box, "finish")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("automatic", [False, True])
-async def test_finish_after_accepted_export_never_exports_or_delivers_again(automatic):
+async def test_parallel_exports_keep_handles_and_delivery_unique(automatic):
+    import asyncio
+
+    file = BoxFile(id="file", name="a", type="File", size=1, warning="cleanup failed")
     ctx = SimpleNamespace(
-        export_box_files=AsyncMock(return_value=[SimpleNamespace(id="accepted")]),
-        reply_files=AsyncMock(),
+        export_box_files=AsyncMock(return_value=[file]),
         delivery=SimpleNamespace(automatic_reply=automatic),
+        reply_files=AsyncMock(),
     )
     box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    assert await box.before_complete() is None
-    await box.finish()
-    await box.finish()
-    ctx.export_box_files.assert_awaited_once()
+    results = await asyncio.gather(box.export_files(["/out/a"]), box.export_files(["/out/a"]))
+    assert all(r["status"] == "accepted" and r["items"][0]["warning"] == "cleanup failed" for r in results)
+    assert box.file_ids == (["file"] if automatic else [])
     assert ctx.reply_files.await_count == (0 if automatic else 1)
-    assert box.file_ids == (["accepted"] if automatic else [])
+    assert not hasattr(box, "before_complete") and not hasattr(box, "finish")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", [RuntimeError("platform down"), asyncio.CancelledError(), TimeoutError(), PermissionError()]
-)
-async def test_platform_failure_never_reenters_generation_or_duplicates_delivery(failure):
-    from pkg.box import AttachmentDeliveryError
+@pytest.mark.parametrize("failure", [RuntimeError("send failed"), PermissionError("no permission")])
+async def test_platform_failure_is_fatal_and_cannot_reexport_or_redeliver(failure):
+    from pkg.agent_core.types import NonRetryableToolError
 
     ctx = SimpleNamespace(
-        export_box_files=AsyncMock(return_value=[SimpleNamespace(id="accepted")]),
-        reply_files=AsyncMock(side_effect=failure),
+        export_box_files=AsyncMock(return_value=[BoxFile(id="file", name="a", type="File", size=1)]),
         delivery=SimpleNamespace(automatic_reply=False),
+        reply_files=AsyncMock(side_effect=failure),
     )
     box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    expected = AttachmentDeliveryError if type(failure) is RuntimeError else type(failure)
+    executor = LangBotToolExecutor(None, set())
+    box.install_tool(SimpleNamespace(tools=[], tool_executor=executor))
+    request = ToolCallRequest.from_raw(
+        {"id": "call", "function": {"name": "export_box_files", "arguments": '{"paths":["/out/a"]}'}}
+    )
     for _ in range(2):
-        with pytest.raises(expected):
-            await box.before_complete()
-    assert box._repair_attempts == 0 and box.file_ids == ["accepted"]
-    ctx.export_box_files.assert_awaited_once()
-    ctx.reply_files.assert_awaited_once()
+        with pytest.raises(NonRetryableToolError, match="platform delivery failed"):
+            await executor.execute(executor.prepare(request))
+    ctx.export_box_files.assert_awaited_once_with(["/out/a"])
+    ctx.reply_files.assert_awaited_once_with(["file"])
+
+
+@pytest.mark.asyncio
+async def test_invalid_host_response_is_not_a_generation_retry():
+    from pkg.agent_core.types import NonRetryableToolError
+
+    ctx = SimpleNamespace(
+        export_box_files=AsyncMock(
+            side_effect=RuntimeError(
+                'ActionCallError: LANGBOT_EXPORT_V1:{"code":"box.export.invalid_response","message":"invalid attachment data","retryable":false}'
+            )
+        )
+    )
+    box = LocalAgentBox(ctx, None)
+    with pytest.raises(NonRetryableToolError, match="invalid attachment data"):
+        await box.export_files(["/out/a"])
+
+
+@pytest.mark.asyncio
+async def test_legacy_sdk_fails_before_acquiring_a_box(monkeypatch):
+    from langbot_plugin.api.entities.builtin.runner.context import RunnerContext
+
+    async def old_export(self):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(RunnerContext, "export_box_files", old_export)
+    api = SimpleNamespace(get_box_status=AsyncMock())
+    with pytest.raises(RuntimeError, match="upgrade them together"):
+        await LocalAgentBox(SimpleNamespace(), api).prepare()
+    api.get_box_status.assert_not_called()
