@@ -1,56 +1,40 @@
-import asyncio
+"""Export errors are ordinary tool results; no completion recovery hook."""
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from langbot_plugin.api.entities.builtin.runner.box import BoxFile
 from pkg.box import LocalAgentBox
+from pkg.agent_core.langbot import LangBotToolExecutor
+from pkg.agent_core.types import ToolCallRequest
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("automatic", [True, False])
-async def test_export_repair_then_success(automatic):
+async def test_explicit_export_error_then_retry():
     ctx = SimpleNamespace(
         export_box_files=AsyncMock(
-            side_effect=[
-                RuntimeError("Sandbox outbox exceeds the file-count limit"),
-                [SimpleNamespace(id="file")],
-            ]
+            side_effect=[RuntimeError("file missing: /out/a"), [BoxFile(id="file", name="a", type="File", size=1)]]
         ),
+        delivery=SimpleNamespace(automatic_reply=True),
         reply_files=AsyncMock(),
-        delivery=SimpleNamespace(automatic_reply=automatic),
     )
     box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    assert "repair 1/2" in await box.before_complete()
-    assert await box.before_complete() is None
-    assert box.file_ids == (["file"] if automatic else [])
-    assert ctx.export_box_files.await_count == 2
-    assert ctx.reply_files.await_count == (0 if automatic else 1)
-
-
-@pytest.mark.asyncio
-async def test_repair_is_bounded():
-    ctx = SimpleNamespace(
-        export_box_files=AsyncMock(side_effect=RuntimeError("Output files exceed the per-run byte limit"))
+    executor = LangBotToolExecutor(None, set())
+    assembly = SimpleNamespace(tools=[], tool_executor=executor)
+    box.install_tool(assembly)
+    request = ToolCallRequest.from_raw(
+        {
+            "id": "export",
+            "type": "function",
+            "function": {"name": "export_box_files", "arguments": '{"paths": ["/out/a"]}'},
+        }
     )
-    box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    assert "repair 1/2" in await box.before_complete()
-    assert "repair 2/2" in await box.before_complete()
-    with pytest.raises(RuntimeError):
-        await box.before_complete()
-    assert ctx.export_box_files.await_count == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error",
-    [PermissionError("denied"), TimeoutError(), asyncio.CancelledError(), RuntimeError("stale Workspace placement")],
-)
-async def test_unrepairable_error_propagates(error):
-    ctx = SimpleNamespace(export_box_files=AsyncMock(side_effect=error))
-    box = LocalAgentBox(ctx, None)
-    box.binding = object()
-    with pytest.raises(type(error)):
-        await box.before_complete()
-    assert box._repair_attempts == 0
+    failed = await executor.execute(executor.prepare(request))
+    assert "file missing" in failed.error
+    assert not box.file_ids
+    success = await executor.execute(executor.prepare(request))
+    assert success.error is None
+    assert box.file_ids == ["file"]
+    assert not hasattr(box, "before_complete")
+    assert not hasattr(box, "finish")

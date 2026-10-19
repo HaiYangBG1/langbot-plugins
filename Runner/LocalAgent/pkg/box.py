@@ -42,42 +42,36 @@ class LocalAgentBox:
         self.api = api
         self.binding = None
         self.file_ids = []
-        self._repair_attempts = 0
 
-    async def before_complete(self):
-        if self.binding is None:
-            return None
-        try:
-            files = await self.ctx.export_box_files()
-        except Exception as exc:
-            reason = str(exc)
-            # SDK 0.7.13 transports Host exceptions as text. Only known
-            # read/budget failures are safe to repair; never retry delivery,
-            # cancellation, permissions, stale bindings or unknown IO errors.
-            repairable = any(
-                marker in reason
-                for marker in (
-                    "Sandbox outbox exceeds ",
-                    "Sandbox output attachment exceeds the export size limit",
-                    "At most 100 output files may be exported per run",
-                    "Output files exceed the per-run byte limit",
-                )
+    def install_tool(self, assembly):
+        from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
+
+        description = "Export selected absolute sandbox file paths. Validates all files, accepts attachments, then cleans up selected files. Required for file delivery."
+        assembly.tools.append(
+            LLMTool(
+                name="export_box_files",
+                human_desc=description,
+                description=description,
+                parameters={
+                    "type": "object",
+                    "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+                    "required": ["paths"],
+                    "additionalProperties": False,
+                },
+                func=self.export_files,
             )
-            if not repairable or self._repair_attempts >= 2:
-                raise
-            self._repair_attempts += 1
-            return (
-                f"Attachment export failed (repair {self._repair_attempts}/2): {reason}. "
-                "Files have not been delivered. Repair the outbox using the existing tools, "
-                "then finish again. Do not repeat unrelated actions or silently discard requested files. "
-                "The same run deadline and tool budget still apply."
-            )
-        self.file_ids = [item.id for item in files]
-        # Platform delivery errors are not file-generation errors.
-        if self.file_ids and not self.ctx.delivery.automatic_reply:
-            await self.ctx.reply_files(self.file_ids)
-            self.file_ids = []
-        return None
+        )
+        assembly.tool_executor.allowed_tools.add("export_box_files")
+        assembly.tool_executor.local_tools["export_box_files"] = self.export_files
+
+    async def export_files(self, paths):
+        files = await self.ctx.export_box_files(paths)
+        ids = [item.id for item in files]
+        if self.ctx.delivery.automatic_reply:
+            self.file_ids = list(dict.fromkeys(self.file_ids + ids))
+        elif ids:
+            await self.ctx.reply_files(ids)
+        return {"status": "accepted", "items": [item.model_dump() for item in files]}
 
     def needed(self):
         tools = {t.tool_name for t in self.api.get_allowed_tools()}
@@ -106,17 +100,8 @@ class LocalAgentBox:
             self.ctx.input.contents = [c for c in self.ctx.input.contents if c.type not in {"file_url", "file_base64"}]
         self.ctx.input.contents.append(
             ContentElement.from_text(
-                f"Sandbox files for this run belong in {self.binding.outbox}/ when they should be delivered "
-                "to the user. Create this directory if needed. The runner exports this directory on successful completion."
+                f"Prefer storing generated artifacts in {self.binding.outbox}/; create it if needed. "
+                "To deliver files, explicitly call export_box_files with their absolute paths and confirm success before finishing. "
+                "Writing a file does not deliver it. Fix reported errors and retry the tool; no automatic export occurs."
             )
         )
-
-    async def finish(self):
-        if self.binding is None:
-            return []
-        files = await self.ctx.export_box_files()
-        ids = [item.id for item in files]
-        if ids and not self.ctx.delivery.automatic_reply:
-            await self.ctx.reply_files(ids)
-            return []
-        return ids
